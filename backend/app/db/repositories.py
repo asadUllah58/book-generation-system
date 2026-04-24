@@ -65,7 +65,7 @@ def reset_book(book_id: str) -> None:
     client.table("feedback_notes").delete().eq("book_id", book_id).execute()
     client.table("books").update(
         {
-            "status": "outline_pending",
+            "status": "created",
             "current_node": None,
             "final_docx_path": None,
             "final_pdf_path": None,
@@ -251,6 +251,18 @@ def update_chapter_summary(chapter_id: str, summary: str) -> None:
     get_supabase().table("chapters").update({"summary": summary}).eq(
         "id", chapter_id
     ).execute()
+
+
+def update_chapter_content(chapter_id: str, content_md: str) -> dict[str, Any]:
+    """Replace the prose of an existing chapter row (used to fill empty slots)."""
+    res = (
+        get_supabase()
+        .table("chapters")
+        .update({"content_md": content_md})
+        .eq("id", chapter_id)
+        .execute()
+    )
+    return res.data[0]
 
 
 # ---------- feedback ----------

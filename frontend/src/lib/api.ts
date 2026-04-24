@@ -1,5 +1,3 @@
-import { REVIEWER } from './reviewer'
-
 const BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -11,15 +9,23 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const text = await res.text().catch(() => '')
     throw new Error(`[${res.status}] ${text || res.statusText}`)
   }
+  if (res.status === 204) return undefined as T
   return res.json() as Promise<T>
 }
 
 // ---------- types ----------
 
+export type BookStatus =
+  | 'created'
+  | 'outline_review'
+  | 'drafting'
+  | 'complete'
+  | 'failed'
+
 export interface Book {
   id: string
   title: string
-  status: string
+  status: BookStatus | string
   current_node: string | null
   final_docx_path: string | null
   final_txt_path: string | null
@@ -63,9 +69,15 @@ export interface Chapter {
   created_at: string
 }
 
-export type FeedbackAction = 'approve' | 'revise' | 'reject'
+export type DownloadFormat = 'docx' | 'pdf' | 'txt' | 'md'
 
-// ---------- fetchers ----------
+export interface DownloadResponse {
+  url: string
+  format: string
+  path: string
+}
+
+// ---------- books ----------
 
 export function getHealth() {
   return request<{ status: string }>('/health')
@@ -109,33 +121,87 @@ export async function uploadBooks(file: File): Promise<Book[]> {
   return res.json() as Promise<Book[]>
 }
 
+// ---------- outlines ----------
+
 export function listOutlines(bookId: string) {
   return request<Outline[]>(`/books/${bookId}/outlines`)
 }
+
+export function generateOutline(bookId: string) {
+  return request<Outline>(`/books/${bookId}/outline/generate`, {
+    method: 'POST',
+  })
+}
+
+export function reviseOutline(bookId: string, note?: string) {
+  return request<Outline>(`/books/${bookId}/outline/revise`, {
+    method: 'POST',
+    body: JSON.stringify({ note: note?.trim() || null }),
+  })
+}
+
+export function editOutline(bookId: string, content: OutlineContent) {
+  return request<Outline>(`/books/${bookId}/outline/edit`, {
+    method: 'POST',
+    body: JSON.stringify({ content }),
+  })
+}
+
+export function approveOutline(bookId: string) {
+  return request<Outline>(`/books/${bookId}/outline/approve`, {
+    method: 'POST',
+  })
+}
+
+// ---------- chapters ----------
 
 export function listChapters(bookId: string) {
   return request<Chapter[]>(`/books/${bookId}/chapters`)
 }
 
-export function submitFeedback(
-  bookId: string,
-  params: {
-    target_type: 'outline' | 'chapter'
-    target_id: string
-    action: FeedbackAction
-    note?: string
-  },
-) {
-  return request<{ resumed: boolean }>(`/books/${bookId}/resume`, {
+export function draftChapters(bookId: string) {
+  return request<Chapter[]>(`/books/${bookId}/chapters/draft`, {
     method: 'POST',
-    body: JSON.stringify({ ...params, reviewer_id: REVIEWER.id }),
   })
 }
 
-export type DownloadFormat = 'docx' | 'pdf' | 'txt'
+export function generateChapter(bookId: string, index: number) {
+  return request<Chapter>(`/books/${bookId}/chapters/${index}/generate`, {
+    method: 'POST',
+  })
+}
 
-export function getDownloadUrl(bookId: string, format: DownloadFormat) {
-  return request<{ url: string; format: string; path: string }>(
+export function reviseChapter(
+  bookId: string,
+  index: number,
+  note?: string,
+) {
+  return request<Chapter>(`/books/${bookId}/chapters/${index}/revise`, {
+    method: 'POST',
+    body: JSON.stringify({ note: note?.trim() || null }),
+  })
+}
+
+export function approveChapter(bookId: string, index: number) {
+  return request<Chapter>(`/books/${bookId}/chapters/${index}/approve`, {
+    method: 'POST',
+  })
+}
+
+// ---------- downloads ----------
+
+export function getCombinedDownloadUrl(bookId: string, format: DownloadFormat) {
+  return request<DownloadResponse>(
     `/books/${bookId}/download?format=${format}`,
+  )
+}
+
+export function getChapterDownloadUrl(
+  bookId: string,
+  index: number,
+  format: DownloadFormat,
+) {
+  return request<DownloadResponse>(
+    `/books/${bookId}/chapters/${index}/download?format=${format}`,
   )
 }

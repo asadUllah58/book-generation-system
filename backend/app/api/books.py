@@ -1,15 +1,20 @@
+"""REST endpoints for the stepper-driven book flow.
+
+Each LLM-backed action is a synchronous request — callers see a spinner while
+the mutation is in-flight, then the fresh resource on return. No background
+graph runs, no interrupt/resume plumbing.
+"""
+
 import logging
 from io import BytesIO
 from typing import Any, Literal, Optional
 
-from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Response, UploadFile
-from langgraph.types import Command
+from fastapi import APIRouter, File, HTTPException, Response, UploadFile
 from openpyxl import load_workbook
 from pydantic import BaseModel, ConfigDict
 
-from app.compile.builder import compile_book_format, create_signed_url
 from app.db import repositories as repo
-from app.graph.graph import clear_thread_state, get_graph
+from app.services import chapter_service, compile_service, outline_service
 
 MAX_BULK_ROWS = 50
 
@@ -65,49 +70,40 @@ class ChapterResponse(BaseModel):
     created_at: str
 
 
-class ResumePayload(BaseModel):
-    target_type: Literal["outline", "chapter"]
-    target_id: str
-    action: Literal["approve", "revise", "reject"]
-    reviewer_id: str
+class RevisePayload(BaseModel):
     note: Optional[str] = None
 
 
-class ResumeResponse(BaseModel):
-    resumed: bool
+class EditOutlinePayload(BaseModel):
+    content: dict[str, Any]
 
 
-# ---------- background helpers ----------
-
-def _thread_config(book_id: str) -> dict[str, Any]:
-    return {"configurable": {"thread_id": book_id}}
-
-
-def _start_graph_run(book_id: str, title: str) -> None:
-    try:
-        get_graph().invoke(
-            {"book_id": book_id, "title": title},
-            config=_thread_config(book_id),
-        )
-    except Exception:
-        log.exception("graph run failed for book %s", book_id)
-        try:
-            repo.update_book_status(book_id, "failed")
-        except Exception:
-            log.exception("could not mark book %s as failed", book_id)
+class DownloadResponse(BaseModel):
+    url: str
+    format: str
+    path: str
 
 
-def _resume_graph_run(book_id: str, action: str, note: Optional[str]) -> None:
-    try:
-        get_graph().invoke(
-            Command(resume={"action": action, "note": note}),
-            config=_thread_config(book_id),
-        )
-    except Exception:
-        log.exception("graph resume failed for book %s", book_id)
+DownloadFormat = Literal["docx", "pdf", "txt", "md"]
 
 
-# ---------- handlers ----------
+# ---------- helpers ----------
+
+def _require_book(book_id: str) -> dict[str, Any]:
+    book = repo.get_book(book_id)
+    if not book:
+        raise HTTPException(status_code=404, detail="book not found")
+    return book
+
+
+def _signed(path: str) -> str:
+    url = compile_service.create_signed_url(path, expires_in_seconds=3600)
+    if not url:
+        raise HTTPException(status_code=500, detail="could not sign storage url")
+    return url
+
+
+# ---------- books ----------
 
 @router.get("", response_model=list[BookResponse])
 def list_books() -> list[BookResponse]:
@@ -115,20 +111,14 @@ def list_books() -> list[BookResponse]:
 
 
 @router.post("", response_model=BookResponse, status_code=201)
-def create_book(
-    payload: CreateBookPayload,
-    background_tasks: BackgroundTasks,
-) -> BookResponse:
+def create_book(payload: CreateBookPayload) -> BookResponse:
+    """Create a book. Outline generation is driven by a separate CTA."""
     book = repo.create_book(payload.title)
-    background_tasks.add_task(_start_graph_run, book["id"], book["title"])
     return BookResponse(**book)
 
 
 @router.post("/bulk", response_model=list[BookResponse], status_code=201)
-async def create_books_bulk(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-) -> list[BookResponse]:
+async def create_books_bulk(file: UploadFile = File(...)) -> list[BookResponse]:
     """Bulk-create books from an .xlsx file.
 
     Format: column A holds titles, row 1 is a header (ignored), data starts
@@ -141,7 +131,7 @@ async def create_books_bulk(
     content = await file.read()
     try:
         wb = load_workbook(filename=BytesIO(content), read_only=True, data_only=True)
-    except Exception as exc:  # noqa: BLE001 — any parse error → 400
+    except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"invalid .xlsx: {exc}") from exc
 
     ws = wb.active
@@ -162,115 +152,188 @@ async def create_books_bulk(
             detail="no titles found — put titles in column A starting at row 2",
         )
 
-    created: list[BookResponse] = []
-    for title in titles:
-        book = repo.create_book(title)
-        # NOTE: all runs kick off at once. Fine at demo scale; a proper queue
-        # would stagger them to avoid LLM rate limits.
-        background_tasks.add_task(_start_graph_run, book["id"], book["title"])
-        created.append(BookResponse(**book))
+    created = [BookResponse(**repo.create_book(t)) for t in titles]
     return created
 
 
 @router.get("/{book_id}", response_model=BookResponse)
 def get_book(book_id: str) -> BookResponse:
-    book = repo.get_book(book_id)
-    if not book:
-        raise HTTPException(status_code=404, detail="book not found")
-    return BookResponse(**book)
+    return BookResponse(**_require_book(book_id))
 
 
 @router.post("/{book_id}/restart", response_model=BookResponse)
-def restart_book(book_id: str, background_tasks: BackgroundTasks) -> BookResponse:
-    """Wipe outlines/chapters/feedback/graph-state and re-run the pipeline.
+def restart_book(book_id: str) -> BookResponse:
+    """Wipe outlines/chapters/feedback/storage and reset the book to `created`.
 
-    The book row (id, title, created_at) is preserved so the UI keeps its
-    identity; everything else is reset to a fresh-start state.
+    Used from the failure-recovery card; keeps id/title/created_at stable so
+    the UI retains its identity.
     """
-    book = repo.get_book(book_id)
-    if not book:
-        raise HTTPException(status_code=404, detail="book not found")
-
-    clear_thread_state(book_id)
+    _require_book(book_id)
     repo.delete_book_storage(book_id)
     repo.reset_book(book_id)
-
-    background_tasks.add_task(_start_graph_run, book_id, book["title"])
-    refreshed = repo.get_book(book_id) or book
+    refreshed = repo.get_book(book_id)
+    assert refreshed is not None
     return BookResponse(**refreshed)
 
 
 @router.delete("/{book_id}", status_code=204, response_class=Response)
 def delete_book(book_id: str) -> Response:
-    """Delete a book and everything attached to it.
-
-    Cascades outlines/chapters/feedback_notes via FKs. Storage cleanup is
-    best-effort — failures are swallowed. Any in-flight LangGraph run keyed
-    by this book_id is orphaned (MemorySaver), which is fine: the next
-    attempt to write to the DB will no-op since the row is gone.
-    """
-    if not repo.get_book(book_id):
-        raise HTTPException(status_code=404, detail="book not found")
+    _require_book(book_id)
     repo.delete_book(book_id)
     repo.delete_book_storage(book_id)
     return Response(status_code=204)
 
 
+# ---------- outlines ----------
+
 @router.get("/{book_id}/outlines", response_model=list[OutlineResponse])
 def list_outlines(book_id: str) -> list[OutlineResponse]:
-    if not repo.get_book(book_id):
-        raise HTTPException(status_code=404, detail="book not found")
+    _require_book(book_id)
     return [OutlineResponse(**o) for o in repo.list_outlines(book_id)]
 
 
+@router.post("/{book_id}/outline/generate", response_model=OutlineResponse)
+def generate_outline(book_id: str) -> OutlineResponse:
+    _require_book(book_id)
+    if repo.get_latest_outline(book_id):
+        raise HTTPException(
+            status_code=409,
+            detail="outline already exists — use revise to regenerate",
+        )
+    try:
+        row = outline_service.generate(book_id)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("outline generation failed for %s", book_id)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return OutlineResponse(**row)
+
+
+@router.post("/{book_id}/outline/revise", response_model=OutlineResponse)
+def revise_outline(book_id: str, payload: RevisePayload) -> OutlineResponse:
+    _require_book(book_id)
+    latest = repo.get_latest_outline(book_id)
+    if not latest:
+        raise HTTPException(status_code=400, detail="no outline to revise")
+    if latest["status"] == "approved":
+        raise HTTPException(status_code=409, detail="outline is already approved")
+    try:
+        row = outline_service.revise(book_id, payload.note)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("outline revision failed for %s", book_id)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return OutlineResponse(**row)
+
+
+@router.post("/{book_id}/outline/edit", response_model=OutlineResponse)
+def edit_outline(book_id: str, payload: EditOutlinePayload) -> OutlineResponse:
+    _require_book(book_id)
+    try:
+        row = outline_service.edit(book_id, payload.content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return OutlineResponse(**row)
+
+
+@router.post("/{book_id}/outline/approve", response_model=OutlineResponse)
+def approve_outline(book_id: str) -> OutlineResponse:
+    _require_book(book_id)
+    try:
+        row = outline_service.approve(book_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return OutlineResponse(**row)
+
+
+# ---------- chapters ----------
+
 @router.get("/{book_id}/chapters", response_model=list[ChapterResponse])
 def list_chapters(book_id: str) -> list[ChapterResponse]:
-    if not repo.get_book(book_id):
-        raise HTTPException(status_code=404, detail="book not found")
+    _require_book(book_id)
     return [ChapterResponse(**c) for c in repo.list_chapters(book_id)]
 
 
-@router.get("/{book_id}/download")
-def download_book(book_id: str, format: Literal["docx", "pdf", "txt"] = "docx") -> dict[str, str]:
-    """Compile a snapshot of the book in the requested format from whatever
-    chapters are currently approved, upload it, and return a 1-hour signed URL.
-
-    Works at any stage — a single approved chapter is enough. Files are
-    overwritten on each download so the latest state always wins.
-    """
-    book = repo.get_book(book_id)
-    if not book:
-        raise HTTPException(status_code=404, detail="book not found")
-
+@router.post("/{book_id}/chapters/draft", response_model=list[ChapterResponse])
+def draft_chapter_slots(book_id: str) -> list[ChapterResponse]:
+    """Create one empty slot per outline chapter. Idempotent."""
+    _require_book(book_id)
     try:
-        path = compile_book_format(book_id, book["title"], format)
+        rows = chapter_service.create_slots(book_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return [ChapterResponse(**c) for c in rows]
+
+
+@router.post(
+    "/{book_id}/chapters/{index}/generate", response_model=ChapterResponse
+)
+def generate_chapter(book_id: str, index: int) -> ChapterResponse:
+    _require_book(book_id)
+    try:
+        row = chapter_service.generate(book_id, index)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        log.exception("chapter generation failed for %s/%s", book_id, index)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return ChapterResponse(**row)
+
+
+@router.post(
+    "/{book_id}/chapters/{index}/revise", response_model=ChapterResponse
+)
+def revise_chapter(
+    book_id: str, index: int, payload: RevisePayload
+) -> ChapterResponse:
+    _require_book(book_id)
+    try:
+        row = chapter_service.revise(book_id, index, payload.note)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        log.exception("chapter revision failed for %s/%s", book_id, index)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return ChapterResponse(**row)
+
+
+@router.post(
+    "/{book_id}/chapters/{index}/approve", response_model=ChapterResponse
+)
+def approve_chapter(book_id: str, index: int) -> ChapterResponse:
+    _require_book(book_id)
+    try:
+        row = chapter_service.approve(book_id, index)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        log.exception("chapter approval failed for %s/%s", book_id, index)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return ChapterResponse(**row)
+
+
+# ---------- downloads ----------
+
+@router.get("/{book_id}/download", response_model=DownloadResponse)
+def download_combined(
+    book_id: str, format: DownloadFormat = "pdf"
+) -> DownloadResponse:
+    """Compile outline + approved chapters into a single file."""
+    _require_book(book_id)
+    try:
+        path = compile_service.compile_combined(book_id, format)
     except RuntimeError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    url = create_signed_url(path, expires_in_seconds=3600)
-    if not url:
-        raise HTTPException(status_code=500, detail="could not sign storage url")
-    return {"url": url, "format": format, "path": path}
+    return DownloadResponse(url=_signed(path), format=format, path=path)
 
 
-@router.post("/{book_id}/resume", response_model=ResumeResponse)
-def resume_book(
-    book_id: str,
-    payload: ResumePayload,
-    background_tasks: BackgroundTasks,
-) -> ResumeResponse:
-    if not repo.get_book(book_id):
-        raise HTTPException(status_code=404, detail="book not found")
-
-    repo.insert_feedback(
-        book_id=book_id,
-        target_type=payload.target_type,
-        target_id=payload.target_id,
-        action=payload.action,
-        reviewer_id=payload.reviewer_id,
-        note=payload.note,
-    )
-    background_tasks.add_task(
-        _resume_graph_run, book_id, payload.action, payload.note
-    )
-    return ResumeResponse(resumed=True)
+@router.get(
+    "/{book_id}/chapters/{index}/download", response_model=DownloadResponse
+)
+def download_chapter(
+    book_id: str, index: int, format: DownloadFormat = "pdf"
+) -> DownloadResponse:
+    _require_book(book_id)
+    try:
+        path = compile_service.compile_chapter(book_id, index, format)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return DownloadResponse(url=_signed(path), format=format, path=path)

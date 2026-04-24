@@ -5,9 +5,9 @@ openpyxl==3.1.5
 pydantic==2.9.2
 pydantic-settings==2.5.2
 python-dotenv==1.0.1
-langgraph==0.2.60
-langgraph-checkpoint-sqlite==2.0.1
 langchain-google-genai==2.0.4
+langchain-groq==0.2.0
+langchain-cerebras==0.4.0
 supabase==2.7.4
 python-docx==1.1.2
 reportlab==4.2.2

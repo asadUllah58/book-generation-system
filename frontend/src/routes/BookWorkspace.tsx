@@ -1,273 +1,203 @@
-import { useEffect, useRef, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import {
-  Chapter,
-  Outline,
-  getBook,
-  listChapters,
-  listOutlines,
-  restartBook,
-} from '../lib/api'
-import { ChapterView } from '../components/ChapterView'
-import { DownloadBar } from '../components/DownloadBar'
-import { LoadingOverlay } from '../components/LoadingOverlay'
-import { OutlineView } from '../components/OutlineView'
-import { ReviewPanel } from '../components/ReviewPanel'
-import { StatusBadge } from '../components/StatusBadge'
+import { useEffect, useMemo } from 'react'
+import { Link, useParams, useSearchParams } from 'react-router-dom'
+import { RotateCcw } from 'lucide-react'
 
-const POLL_MS = 3000
+import { StatusBadge } from '@/components/StatusBadge'
+import { Stepper, type StepDef } from '@/components/Stepper'
+import { ChaptersStep } from '@/components/steps/ChaptersStep'
+import { FinalizeStep } from '@/components/steps/FinalizeStep'
+import { OutlineStep } from '@/components/steps/OutlineStep'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent } from '@/components/ui/card'
+import type { Chapter, Outline } from '@/lib/api'
+import { useBookQuery, useRestartBookMutation } from '@/queries/books'
+import { useChaptersQuery } from '@/queries/chapters'
+import { useOutlinesQuery } from '@/queries/outlines'
 
-// Polling is only useful while the graph is actively working OR while a
-// reviewer just submitted feedback and we're waiting for the status flip.
-// Review/terminal states are quiescent: the next change requires a user
-// action which itself invalidates queries.
-const WORKING_STATUSES = new Set([
-  'outline_pending',
-  'drafting',
-  'compiling',
-])
-
-function pollInterval(
-  status: string | undefined,
-  resuming: boolean,
-): number | false {
-  if (!status) return POLL_MS // initial load — keep polling until we have data
-  if (resuming) return POLL_MS
-  if (WORKING_STATUSES.has(status)) return POLL_MS
-  return false
-}
+const STEPS: StepDef[] = [
+  {
+    id: 1,
+    label: 'Generate Outline',
+    description: 'AI-drafted chapter outline.',
+  },
+  {
+    id: 2,
+    label: 'Draft Chapters',
+    description: 'Generate, review, approve.',
+  },
+  {
+    id: 3,
+    label: 'Finalize Chapters',
+    description: 'Download your book.',
+  },
+]
 
 function latestOutline(outlines: Outline[] | undefined): Outline | null {
   if (!outlines?.length) return null
   return [...outlines].sort((a, b) => b.version - a.version)[0]
 }
 
-function latestChapter(chapters: Chapter[] | undefined): Chapter | null {
-  if (!chapters?.length) return null
-  const sorted = [...chapters].sort(
-    (a, b) => a.index - b.index || a.version - b.version,
-  )
-  return sorted[sorted.length - 1] ?? null
+function anyApprovedOutline(outlines: Outline[] | undefined): boolean {
+  return !!outlines?.some((o) => o.status === 'approved')
+}
+
+function anyApprovedChapter(chapters: Chapter[] | undefined): boolean {
+  return !!chapters?.some((c) => c.status === 'approved')
+}
+
+function approvedOutline(outlines: Outline[] | undefined): Outline | null {
+  if (!outlines?.length) return null
+  const approved = outlines.filter((o) => o.status === 'approved')
+  if (!approved.length) return null
+  return approved.sort((a, b) => b.version - a.version)[0]
 }
 
 export default function BookWorkspace() {
   const { id } = useParams<{ id: string }>()
   const bookId = id!
+  const [searchParams, setSearchParams] = useSearchParams()
 
-  // Keeps the overlay up from "feedback submitted" until the graph has
-  // actually advanced the book's status — covers the gap between POST-return
-  // and the first status flip (set by the next node at its entry).
-  const [resuming, setResuming] = useState(false)
-  const statusAtSubmitRef = useRef<string | undefined>(undefined)
+  const book = useBookQuery(bookId)
+  const outlines = useOutlinesQuery(bookId)
+  const chapters = useChaptersQuery(bookId)
+  const restart = useRestartBookMutation(bookId)
 
-  const book = useQuery({
-    queryKey: ['book', bookId],
-    queryFn: () => getBook(bookId),
-    refetchInterval: (query) =>
-      pollInterval(query.state.data?.status, resuming),
-  })
+  const unlocked = useMemo(
+    () => ({
+      1: true,
+      2: anyApprovedOutline(outlines.data),
+      3: anyApprovedChapter(chapters.data),
+    }),
+    [outlines.data, chapters.data],
+  )
 
-  const status = book.data?.status
-  const childInterval = pollInterval(status, resuming)
-
-  const outlines = useQuery({
-    queryKey: ['outlines', bookId],
-    queryFn: () => listOutlines(bookId),
-    refetchInterval: childInterval,
-  })
-  const chapters = useQuery({
-    queryKey: ['chapters', bookId],
-    queryFn: () => listChapters(bookId),
-    refetchInterval: childInterval,
-  })
-
-  const qc = useQueryClient()
-
-  useEffect(() => {
-    if (!resuming) return
-    const current = book.data?.status
-    if (current && current !== statusAtSubmitRef.current) {
-      setResuming(false)
+  const requestedStep = Number(searchParams.get('step') ?? '1')
+  const activeStep = (() => {
+    if (requestedStep >= 1 && requestedStep <= 3 && unlocked[requestedStep as 1 | 2 | 3]) {
+      return requestedStep
     }
-  }, [book.data?.status, resuming])
+    return 1
+  })()
 
-  // When polling was paused (review/terminal state) and we re-enter a
-  // working/resuming window, kick the queries so refetchInterval re-evaluates
-  // with the new closure and starts polling again.
+  // Normalize an invalid ?step= param (e.g. a locked step, or stale after a
+  // page refresh). Deferred until queries settle so we don't briefly "correct"
+  // step=2 down to step=1 while outline data is still loading.
+  const queriesSettled =
+    !outlines.isLoading && !chapters.isLoading && !book.isLoading
   useEffect(() => {
-    if (resuming) {
-      qc.invalidateQueries({ queryKey: ['book', bookId] })
+    if (!queriesSettled) return
+    const current = searchParams.get('step')
+    if (current && Number(current) !== activeStep) {
+      const next = new URLSearchParams(searchParams)
+      next.set('step', String(activeStep))
+      setSearchParams(next, { replace: true })
     }
-  }, [resuming, qc, bookId])
+  }, [activeStep, queriesSettled, searchParams, setSearchParams])
 
-  // When book.status changes, refresh outlines/chapters once so the UI
-  // doesn't lag a poll cycle behind on the rows that the next node just
-  // wrote (new chapter on entry, new outline version on revise/reject, etc.).
-  useEffect(() => {
-    if (!status) return
-    qc.invalidateQueries({ queryKey: ['outlines', bookId] })
-    qc.invalidateQueries({ queryKey: ['chapters', bookId] })
-  }, [status, qc, bookId])
-
-  const handleReviewSubmitted = () => {
-    statusAtSubmitRef.current = book.data?.status
-    setResuming(true)
+  const selectStep = (step: number) => {
+    if (!unlocked[step as 1 | 2 | 3]) return
+    const next = new URLSearchParams(searchParams)
+    next.set('step', String(step))
+    setSearchParams(next, { replace: false })
   }
-
-  const restart = useMutation({
-    mutationFn: () => restartBook(bookId),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['book', bookId] })
-      qc.invalidateQueries({ queryKey: ['outlines', bookId] })
-      qc.invalidateQueries({ queryKey: ['chapters', bookId] })
-    },
-  })
 
   if (book.isLoading || !book.data) {
-    return <LoadingOverlay show message="Loading book…" />
-  }
-  if (book.isError)
     return (
-      <div className="text-sm text-red-600">
+      <Card>
+        <CardContent className="py-12 text-center text-sm text-muted-foreground">
+          Loading book…
+        </CardContent>
+      </Card>
+    )
+  }
+  if (book.isError) {
+    return (
+      <div className="text-sm text-destructive">
         {(book.error as Error).message}
       </div>
     )
+  }
 
-  const currentOutline = latestOutline(outlines.data)
-  const currentChapter = latestChapter(chapters.data)
-  // Count chapter indices that have at least one approved version — matches
-  // what the backend's compile_book would include in a download.
-  const approvedChapterCount = (() => {
-    if (!chapters.data) return 0
-    const seen = new Set<number>()
-    for (const c of chapters.data) {
-      if (c.status === 'approved') seen.add(c.index)
-    }
-    return seen.size
-  })()
+  const approved = approvedOutline(outlines.data)
+  const latestO = latestOutline(outlines.data)
+  // Step 1 always shows the latest outline so users can see revision state.
+  // Step 2/3 consume the approved outline which is what chapter work is keyed to.
+  const outlineForStepOne = latestO
 
   return (
     <div className="space-y-6">
-      <div className="flex items-start justify-between">
+      <div className="flex items-start justify-between gap-4">
         <div>
           <Link
             to="/"
-            className="text-sm text-slate-500 hover:underline"
+            className="text-sm text-muted-foreground hover:underline"
           >
             ← Back to books
           </Link>
           <h1 className="mt-2 text-2xl font-semibold">{book.data.title}</h1>
-          <div className="mt-2 flex items-center gap-2">
-            <StatusBadge status={status} />
-            {book.data.current_node && (
-              <span className="text-xs text-slate-500">
-                at {book.data.current_node}
-              </span>
-            )}
+          <div className="mt-2">
+            <StatusBadge status={book.data.status} />
           </div>
         </div>
       </div>
 
-      {currentOutline && <OutlineView outline={currentOutline} />}
+      <Stepper
+        steps={STEPS}
+        active={activeStep}
+        unlocked={unlocked}
+        onSelect={selectStep}
+      />
 
-      {status === 'outline_review' && currentOutline && (
-        <ReviewPanel
+      {book.data.status === 'failed' && (
+        <Card className="border-destructive/40 bg-destructive/5">
+          <CardContent className="py-5">
+            <h3 className="text-sm font-semibold text-destructive">
+              The pipeline hit an error
+            </h3>
+            <p className="mt-1 text-sm">
+              Wipe outlines, chapters, and compiled files and start over.
+            </p>
+            <div className="mt-3">
+              <Button
+                variant="destructive"
+                onClick={() => restart.mutate()}
+                disabled={restart.isPending}
+              >
+                <RotateCcw className="h-4 w-4" />
+                {restart.isPending ? 'Restarting…' : 'Restart pipeline'}
+              </Button>
+            </div>
+            {restart.isError && (
+              <div className="mt-2 text-sm text-destructive">
+                {(restart.error as Error).message}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
+      {activeStep === 1 && (
+        <OutlineStep
           bookId={bookId}
-          targetType="outline"
-          targetId={currentOutline.id}
-          label={`outline v${currentOutline.version}`}
-          onSubmitted={handleReviewSubmitted}
+          outline={outlineForStepOne}
+          onOutlineApproved={() => selectStep(2)}
         />
       )}
 
-      {status === 'chapter_review' && currentChapter && (
-        <>
-          <ChapterView chapter={currentChapter} />
-          <ReviewPanel
-            bookId={bookId}
-            targetType="chapter"
-            targetId={currentChapter.id}
-            label={`chapter ${currentChapter.index + 1} v${currentChapter.version}`}
-            onSubmitted={handleReviewSubmitted}
-          />
-        </>
-      )}
-
-      {status === 'drafting' && (
-        <div className="rounded-lg border border-blue-200 bg-blue-50 p-4">
-          <div className="flex items-center gap-3">
-            <div className="h-5 w-5 animate-spin rounded-full border-2 border-blue-200 border-t-blue-700" />
-            <div className="text-sm font-medium text-blue-900">
-              Drafting chapter {approvedChapterCount + 1}…
-            </div>
-          </div>
-        </div>
-      )}
-
-      {approvedChapterCount > 0 && (
-        <DownloadBar
+      {activeStep === 2 && approved && (
+        <ChaptersStep
           bookId={bookId}
-          approvedCount={approvedChapterCount}
-          finalized={status === 'complete'}
+          outline={approved}
+          chapters={chapters.data ?? []}
         />
       )}
 
-      <LoadingOverlay
-        show={status === 'outline_pending'}
-        message="Generating outline…"
-      />
-      <LoadingOverlay
-        show={status === 'compiling'}
-        message="Compiling final draft…"
-      />
-      <LoadingOverlay show={resuming} message="Resuming pipeline…" />
-
-      {status === 'failed' && (
-        <div className="rounded-lg border border-red-200 bg-red-50 p-6">
-          <h3 className="text-sm font-semibold text-red-900">
-            The pipeline hit an error
-          </h3>
-          <p className="mt-1 text-sm text-red-800">
-            The backend caught an exception on a previous run (check logs for
-            details). You can restart from scratch — this keeps the book's
-            title and id, but wipes outlines, chapters, and feedback.
-          </p>
-          <div className="mt-3 flex gap-2">
-            <button
-              type="button"
-              onClick={() => restart.mutate()}
-              disabled={restart.isPending}
-              className="rounded-md bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
-            >
-              {restart.isPending ? 'Restarting…' : 'Restart pipeline'}
-            </button>
-          </div>
-          {restart.isError && (
-            <div className="mt-2 text-sm text-red-700">
-              {(restart.error as Error).message}
-            </div>
-          )}
-        </div>
-      )}
-
-      {chapters.data && chapters.data.length > 0 && (
-        <section className="rounded-lg border bg-white p-4">
-          <h3 className="text-sm font-semibold text-slate-700">
-            Chapter history
-          </h3>
-          <ul className="mt-2 divide-y">
-            {chapters.data.map((c) => (
-              <li key={c.id} className="flex items-center justify-between py-2 text-sm">
-                <span>
-                  Chapter {c.index + 1}
-                  {c.title ? ` — ${c.title}` : ''} (v{c.version})
-                </span>
-                <StatusBadge status={c.status} />
-              </li>
-            ))}
-          </ul>
-        </section>
+      {activeStep === 3 && (
+        <FinalizeStep
+          bookId={bookId}
+          outline={approved}
+          chapters={chapters.data ?? []}
+        />
       )}
     </div>
   )
